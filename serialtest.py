@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, threading, time, serial
+import sys, serial
 from pynput import keyboard
 
 PAN_VEL = 1000
@@ -22,18 +22,11 @@ def main():
 
     ser = serial.Serial(port, 115200, timeout=1)
     print(f"Terhubung ke {port}")
-    stop = threading.Event()
     held = set()
-
-    def reader():
-        while not stop.is_set():
-            if ser.in_waiting:
-                line = ser.readline().decode(errors="ignore").strip()
-                if line: print(f"  [STM32] {line}")
-            time.sleep(0.01)
 
     def tx(cmd):
         ser.write((cmd + "\n").encode())
+        print(f"-> {cmd}")
 
     def on_press(key):
         if key in held: return
@@ -55,13 +48,12 @@ def main():
         if   key in (keyboard.Key.right, keyboard.Key.left):  tx("P+0")
         elif key in (keyboard.Key.up, keyboard.Key.down):     tx("T+0")
 
-    threading.Thread(target=reader, daemon=True).start()
     print("Arrows=pan/tilt  s=stop  1/2=invert  ?=status  q=quit")
 
     with keyboard.Listener(on_press=on_press, on_release=on_release) as l:
         l.join()
 
-    stop.set(); tx("S"); ser.close()
+    tx("S"); ser.close()
 
 if __name__ == "__main__":
     main()

@@ -24,9 +24,8 @@
 #define STEP_FREQ       100000  // TIM3 ISR rate (Hz)
 #define MAX_VEL         20000   // Max velocity (steps/s)
 #define RAMP_TICK_DIV   10      // 100kHz / 10 = 10kHz velocity ramp
-#define ACCEL_RATE      4       // Velocity change per ramp tick (steps/s)
+#define ACCEL_RATE      2       // Velocity change per ramp tick (steps/s)
 #define DIR_SETUP_TICKS 5      // 10us ticks to wait after DIR change (50us)
-#define REVERSE_HOLD_TICKS 500 // 10us ticks to hold after reversal (5ms)
 #define SERIAL_BUF_SIZE 256
 /* USER CODE END PD */
 
@@ -48,7 +47,7 @@ volatile int32_t current_vel_tilt = 0;
 
 // Direction invert (written by main, read by ISR)
 volatile int8_t pan_dir_invert  = 0;
-volatile int8_t tilt_dir_invert = 0;
+volatile int8_t tilt_dir_invert = 1;
 
 // Serial circular buffer
 volatile uint8_t  serial_rx_buf[SERIAL_BUF_SIZE];
@@ -121,21 +120,10 @@ void step_isr(void) {
     /* -- Pan ramp -- */
     {
         static uint8_t pan_dir_state = 0;
-        static uint16_t pan_reverse_hold = 0;
         int32_t cur = current_vel_pan;
         int32_t tgt = req_vel_pan;
-        if (pan_reverse_hold > 0) {
-            pan_reverse_hold--;
-            pan_period = 0;
-            pan_counter = 0;
-            GPIOB->BSRR = (uint32_t)GPIO_PIN_0 << 16;   // step LOW
-            tgt = 0;
-        } else if (cur != 0 && tgt != 0 && ((cur > 0 && tgt < 0) || (cur < 0 && tgt > 0))) {
-            /* Force stop and hold before reversing */
-            pan_reverse_hold = REVERSE_HOLD_TICKS;
-            pan_period = 0;
-            pan_counter = 0;
-            GPIOB->BSRR = (uint32_t)GPIO_PIN_0 << 16;   // step LOW
+        if (cur != 0 && tgt != 0 && ((cur > 0 && tgt < 0) || (cur < 0 && tgt > 0))) {
+            /* Decelerate to zero before reversing for smoother motion */
             tgt = 0;
         }
         if (cur != tgt) {
@@ -182,21 +170,10 @@ void step_isr(void) {
     /* -- Tilt ramp -- */
     {
         static uint8_t tilt_dir_state = 0;
-        static uint16_t tilt_reverse_hold = 0;
         int32_t cur = current_vel_tilt;
         int32_t tgt = req_vel_tilt;
-        if (tilt_reverse_hold > 0) {
-            tilt_reverse_hold--;
-            tilt_period = 0;
-            tilt_counter = 0;
-            GPIOA->BSRR = (uint32_t)GPIO_PIN_6 << 16;   // step LOW
-            tgt = 0;
-        } else if (cur != 0 && tgt != 0 && ((cur > 0 && tgt < 0) || (cur < 0 && tgt > 0))) {
-            /* Force stop and hold before reversing */
-            tilt_reverse_hold = REVERSE_HOLD_TICKS;
-            tilt_period = 0;
-            tilt_counter = 0;
-            GPIOA->BSRR = (uint32_t)GPIO_PIN_6 << 16;   // step LOW
+        if (cur != 0 && tgt != 0 && ((cur > 0 && tgt < 0) || (cur < 0 && tgt > 0))) {
+            /* Decelerate to zero before reversing for smoother motion */
             tgt = 0;
         }
         if (cur != tgt) {
