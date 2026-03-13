@@ -24,7 +24,8 @@
 #define STEP_FREQ       100000  // TIM3 ISR rate (Hz)
 #define MAX_VEL         20000   // Max velocity (steps/s)
 #define RAMP_TICK_DIV   10      // 100kHz / 10 = 10kHz velocity ramp
-#define ACCEL_RATE      2       // Velocity change per ramp tick (steps/s)
+#define ACCEL_RATE      1       // Velocity change per ramp tick (steps/s)
+#define RAMP_SLOWDOWN   2       // Additional divider to slow ramp updates
 #define DIR_SETUP_TICKS 5      // 10us ticks to wait after DIR change (50us)
 #define SERIAL_BUF_SIZE 256
 /* USER CODE END PD */
@@ -113,8 +114,8 @@ void step_isr(void) {
     }
 
     /* ---- 10kHz velocity ramp (every 10 ticks) ---- */
-    static uint8_t ramp_tick = 0;
-    if (++ramp_tick < RAMP_TICK_DIV) return;
+    static uint16_t ramp_tick = 0;
+    if (++ramp_tick < (RAMP_TICK_DIV * RAMP_SLOWDOWN)) return;
     ramp_tick = 0;
 
     /* -- Pan ramp -- */

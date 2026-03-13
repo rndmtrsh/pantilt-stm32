@@ -39,16 +39,13 @@ def main():
             c = key.char
             if   c == "q": return False
             elif c == "s": tx("S")
-            elif c == "?": tx("?")
-            elif c == "1": tx("IP")
-            elif c == "2": tx("IT")
 
     def on_release(key):
         held.discard(key)
         if   key in (keyboard.Key.right, keyboard.Key.left):  tx("P+0")
         elif key in (keyboard.Key.up, keyboard.Key.down):     tx("T+0")
 
-    print("Arrows=pan/tilt  s=stop  1/2=invert  ?=status  q=quit")
+    print("Arrows=pan/tilt  s=stop  q=quit")
 
     with keyboard.Listener(on_press=on_press, on_release=on_release) as l:
         l.join()
