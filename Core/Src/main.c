@@ -216,7 +216,8 @@ void step_isr(void) {
 
 /* ---- Send response via USB CDC ---- */
 void send_response(const char *msg) {
-    CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+    // CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
+    (void)msg;
 }
 
 /* ---- Command parsing ---- */
