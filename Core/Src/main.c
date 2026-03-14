@@ -16,7 +16,6 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private define ------------------------------------------------------------*/
@@ -66,7 +65,6 @@ static void MX_GPIO_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 void step_isr(void);             // called from TIM3_IRQHandler
-void send_response(const char *msg);
 void process_command(char *cmd);
 void CDC_Receive_Handler(uint8_t* Buf, uint32_t Len);
 void process_serial_data(void);
@@ -215,16 +213,30 @@ void step_isr(void) {
     }
 }
 
-/* ---- Send response via USB CDC ---- */
-void send_response(const char *msg) {
-    // CDC_Transmit_FS((uint8_t*)msg, strlen(msg));
-    (void)msg;
+static int32_t clamp_vel(int32_t v) {
+    if (v > MAX_VEL) return MAX_VEL;
+    if (v < -MAX_VEL) return -MAX_VEL;
+    return v;
+}
+
+static int parse_vel_token(const char *tok, int32_t *out, char *axis_out) {
+    const char *p = tok;
+    while (*p == ' ' || *p == '\t') p++;
+    char axis = 0;
+    if (*p == 'P' || *p == 'p' || *p == 'T' || *p == 't') {
+        axis = *p;
+        p++;
+    }
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p) return 0;
+    *out = clamp_vel((int32_t)v);
+    *axis_out = axis;
+    return 1;
 }
 
 /* ---- Command parsing ---- */
 void process_command(char *cmd) {
-    char resp[64];
-
     if (cmd[0] == 'S' || cmd[0] == 's') {
         /* Hard stop: zero everything immediately */
         req_vel_pan  = 0; req_vel_tilt  = 0;
@@ -232,28 +244,49 @@ void process_command(char *cmd) {
         pan_period  = 0; tilt_period  = 0;
         GPIOB->BSRR = (uint32_t)GPIO_PIN_0 << 16;  // pan step LOW
         GPIOA->BSRR = (uint32_t)GPIO_PIN_6 << 16;  // tilt step LOW
-        send_response("OK S\r\n");
         return;
     }
 
-    if ((cmd[0] == 'I' || cmd[0] == 'i') && (cmd[1] == 'P' || cmd[1] == 'p')) {
-        pan_dir_invert = !pan_dir_invert;
-        snprintf(resp, sizeof(resp), "OK IP=%d\r\n", (int)pan_dir_invert);
-        send_response(resp);
-        return;
-    }
-    if ((cmd[0] == 'I' || cmd[0] == 'i') && (cmd[1] == 'T' || cmd[1] == 't')) {
-        tilt_dir_invert = !tilt_dir_invert;
-        snprintf(resp, sizeof(resp), "OK IT=%d\r\n", (int)tilt_dir_invert);
-        send_response(resp);
-        return;
-    }
+    if (strchr(cmd, ',') || cmd[0] == '+' || cmd[0] == '-' || (cmd[0] >= '0' && cmd[0] <= '9')) {
+        int32_t pan_val = req_vel_pan;
+        int32_t tilt_val = req_vel_tilt;
+        uint8_t pan_set = 0;
+        uint8_t tilt_set = 0;
+        uint8_t next_axis = 0;
 
-    if (cmd[0] == '?') {
-        snprintf(resp, sizeof(resp), "P=%ld T=%ld IP=%d IT=%d\r\n",
-                 (long)current_vel_pan, (long)current_vel_tilt,
-                 (int)pan_dir_invert, (int)tilt_dir_invert);
-        send_response(resp);
+        char *tok = cmd;
+        while (tok) {
+            char *next = strchr(tok, ',');
+            if (next) {
+                *next = '\0';
+                next++;
+            }
+            int32_t v = 0;
+            char axis = 0;
+            if (!parse_vel_token(tok, &v, &axis)) {
+                return;
+            }
+            if (axis == 'P' || axis == 'p') {
+                pan_val = v;
+                pan_set = 1;
+            } else if (axis == 'T' || axis == 't') {
+                tilt_val = v;
+                tilt_set = 1;
+            } else {
+                if (next_axis == 0) {
+                    pan_val = v;
+                    pan_set = 1;
+                    next_axis = 1;
+                } else {
+                    tilt_val = v;
+                    tilt_set = 1;
+                }
+            }
+            tok = next;
+        }
+
+        if (pan_set) req_vel_pan = pan_val;
+        if (tilt_set) req_vel_tilt = tilt_val;
         return;
     }
 
@@ -266,8 +299,6 @@ void process_command(char *cmd) {
         } else {
             req_vel_pan = 0;
         }
-        snprintf(resp, sizeof(resp), "OK P=%ld\r\n", (long)req_vel_pan);
-        send_response(resp);
         return;
     }
 
@@ -280,8 +311,6 @@ void process_command(char *cmd) {
         } else {
             req_vel_tilt = 0;
         }
-        snprintf(resp, sizeof(resp), "OK T=%ld\r\n", (long)req_vel_tilt);
-        send_response(resp);
         return;
     }
 }
