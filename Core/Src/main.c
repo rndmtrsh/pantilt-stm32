@@ -1,8 +1,8 @@
-/* USER CODE BEGIN Header*/
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Stepper pan-tilt controller (simple version for debugging)
+  * @brief          : Stepper pan-tilt controller with Watchdog
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -11,6 +11,7 @@
 #include "main.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
+#include "iwdg.h"               // <-- Tambahan untuk IWDG
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -20,34 +21,38 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define STEP_FREQ       100000  // TIM3 ISR rate (Hz)
-#define MAX_VEL         20000   // Max velocity (steps/s)
-#define RAMP_TICK_DIV   10      // 100kHz / 10 = 10kHz velocity ramp
-#define ACCEL_RATE      1       // Velocity change per ramp tick (steps/s)
-#define RAMP_SLOWDOWN   2       // Additional divider to slow ramp updates
-#define DIR_SETUP_TICKS 5      // 10us ticks to wait after DIR change (50us)
-#define SERIAL_BUF_SIZE 256
+#define STEP_FREQ         100000  // TIM3 ISR rate (Hz)
+#define MAX_VEL           20000    // Max velocity (steps/s)  
+#define VEL_UPDATE_TICKS  10      // 100kHz / 10 = 10kHz velocity update
+#define DIR_SETUP_TICKS   5       // 10µs ticks to wait after DIR change (50µs)
+#define SERIAL_BUF_SIZE   256
+
+/* Watchdog timeout = (4*2^IWDG_PRESCALER / LSI) * IWDG_RELOAD
+   LSI ~ 32000 Hz, Prescaler 256 => tick 125 Hz.
+   Reload = 62 => timeout ≈ 496 ms */
+#define IWDG_TIMEOUT_MS   500
 /* USER CODE END PD */
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim3;      // Step generation timebase
+IWDG_HandleTypeDef hiwdg;     // Watchdog handler
 
 /* USER CODE BEGIN PV */
 // Step generation (ISR context)
-volatile uint32_t pan_period  = 0;
-volatile uint32_t pan_counter = 0;
+volatile uint32_t pan_period   = 0;
+volatile uint32_t pan_counter  = 0;
 volatile uint32_t tilt_period  = 0;
 volatile uint32_t tilt_counter = 0;
 
 // Velocity (current: written by ISR, read by main; requested: written by main, read by ISR)
-volatile int32_t req_vel_pan  = 0;
-volatile int32_t req_vel_tilt = 0;
+volatile int32_t req_vel_pan      = 0;
+volatile int32_t req_vel_tilt     = 0;
 volatile int32_t current_vel_pan  = 0;
 volatile int32_t current_vel_tilt = 0;
 
 // Direction invert (written by main, read by ISR)
-volatile int8_t pan_dir_invert  = 0;
-volatile int8_t tilt_dir_invert = 1;
+volatile int8_t pan_dir_invert   = 0;
+volatile int8_t tilt_dir_invert  = 1;
 
 // Serial circular buffer
 volatile uint8_t  serial_rx_buf[SERIAL_BUF_SIZE];
@@ -63,6 +68,7 @@ uint8_t cmd_idx = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_IWDG_Init(void);   // <-- Prototipe IWDG
 /* USER CODE BEGIN PFP */
 void step_isr(void);             // called from TIM3_IRQHandler
 void process_command(char *cmd);
@@ -74,11 +80,8 @@ void process_serial_data(void);
 /* USER CODE BEGIN 0 */
 
 /*
- * Called from TIM3_IRQHandler every 10us (100kHz).
- * Handles: step pulse generation + velocity ramp (every 10th tick = 0.1ms).
- *
- * All step/direction/ramp logic runs in ONE ISR context = no race conditions,
- * no __disable_irq() needed.
+ * Called from TIM3_IRQHandler every 10µs (100kHz).
+ * Generates step pulses and directly applies the requested velocity (no ramp).
  *
  * Pin mapping:
  *   PB0 = pan step,  PB1 = pan dir
@@ -111,40 +114,25 @@ void step_isr(void) {
         if (++tilt_counter >= tilt_period) tilt_counter = 0;
     }
 
-    /* ---- 10kHz velocity ramp (every 10 ticks) ---- */
-    static uint16_t ramp_tick = 0;
-    if (++ramp_tick < (RAMP_TICK_DIV * RAMP_SLOWDOWN)) return;
-    ramp_tick = 0;
+    /* ---- 10kHz velocity update (every 10 ticks) ---- */
+    static uint16_t update_tick = 0;
+    if (++update_tick < VEL_UPDATE_TICKS) return;
+    update_tick = 0;
 
-    /* -- Pan ramp -- */
+    /* -- Pan direct velocity apply -- */
     {
         static uint8_t pan_dir_state = 0;
-        int32_t cur = current_vel_pan;
-        int32_t tgt = req_vel_pan;
-        if (cur != 0 && tgt != 0 && ((cur > 0 && tgt < 0) || (cur < 0 && tgt > 0))) {
-            /* Decelerate to zero before reversing for smoother motion */
-            tgt = 0;
-        }
-        if (cur != tgt) {
-            int32_t diff = tgt - cur;
-            int32_t step = (diff > 0) ? ACCEL_RATE : -ACCEL_RATE;
-            /* don't overshoot target */
-            if ((diff > 0 && step > diff) || (diff < 0 && step < diff))
-                step = diff;
-            int32_t next = cur + step;
-            /* must pass through zero on direction reversal */
-            if ((cur > 0 && next < 0) || (cur < 0 && next > 0))
-                next = 0;
-            if (next > MAX_VEL)  next = MAX_VEL;
-            if (next < -MAX_VEL) next = -MAX_VEL;
-            current_vel_pan = next;
+        int32_t next = req_vel_pan;
+        if (next > MAX_VEL)  next = MAX_VEL;
+        if (next < -MAX_VEL) next = -MAX_VEL;
 
+        if (next != current_vel_pan) {
+            current_vel_pan = next;
             if (next == 0) {
                 pan_period = 0;
                 pan_counter = 0;
                 GPIOB->BSRR = (uint32_t)GPIO_PIN_0 << 16;   // step LOW
             } else {
-                /* set direction FIRST (setup time before next step edge) */
                 uint8_t dir = ((next > 0) ^ pan_dir_invert) ? 1U : 0U;
                 if (dir)
                     GPIOB->BSRR = GPIO_PIN_1;                // DIR HIGH
@@ -156,7 +144,6 @@ void step_isr(void) {
                     pan_counter = 0;
                     pan_dir_hold = DIR_SETUP_TICKS;
                 }
-                /* set period */
                 uint32_t abs_v = (next > 0) ? (uint32_t)next : (uint32_t)(-next);
                 uint32_t p = (STEP_FREQ + (abs_v / 2U)) / abs_v;
                 if (p < 2) p = 2;
@@ -166,27 +153,15 @@ void step_isr(void) {
         }
     }
 
-    /* -- Tilt ramp -- */
+    /* -- Tilt direct velocity apply -- */
     {
         static uint8_t tilt_dir_state = 0;
-        int32_t cur = current_vel_tilt;
-        int32_t tgt = req_vel_tilt;
-        if (cur != 0 && tgt != 0 && ((cur > 0 && tgt < 0) || (cur < 0 && tgt > 0))) {
-            /* Decelerate to zero before reversing for smoother motion */
-            tgt = 0;
-        }
-        if (cur != tgt) {
-            int32_t diff = tgt - cur;
-            int32_t step = (diff > 0) ? ACCEL_RATE : -ACCEL_RATE;
-            if ((diff > 0 && step > diff) || (diff < 0 && step < diff))
-                step = diff;
-            int32_t next = cur + step;
-            if ((cur > 0 && next < 0) || (cur < 0 && next > 0))
-                next = 0;
-            if (next > MAX_VEL)  next = MAX_VEL;
-            if (next < -MAX_VEL) next = -MAX_VEL;
-            current_vel_tilt = next;
+        int32_t next = req_vel_tilt;
+        if (next > MAX_VEL)  next = MAX_VEL;
+        if (next < -MAX_VEL) next = -MAX_VEL;
 
+        if (next != current_vel_tilt) {
+            current_vel_tilt = next;
             if (next == 0) {
                 tilt_period = 0;
                 tilt_counter = 0;
@@ -328,6 +303,7 @@ void CDC_Receive_Handler(uint8_t* Buf, uint32_t Len) {
 
 /* ---- Process serial data from circular buffer ---- */
 void process_serial_data(void) {
+    uint8_t new_command = 0;
     while (serial_rx_tail != serial_rx_head) {
         uint8_t c = serial_rx_buf[serial_rx_tail];
         serial_rx_tail = (serial_rx_tail + 1) % SERIAL_BUF_SIZE;
@@ -337,6 +313,7 @@ void process_serial_data(void) {
                 cmd_buffer[cmd_idx] = '\0';
                 process_command(cmd_buffer);
                 cmd_idx = 0;
+                new_command = 1;  // ada perintah baru, feed watchdog
             }
         } else {
             if (cmd_idx < sizeof(cmd_buffer) - 1) {
@@ -345,6 +322,10 @@ void process_serial_data(void) {
                 cmd_idx = 0;
             }
         }
+    }
+    // Feed watchdog jika ada perintah baru saja dieksekusi
+    if (new_command) {
+        HAL_IWDG_Refresh(&hiwdg);
     }
 }
 /* USER CODE END 0 */
@@ -355,11 +336,15 @@ void process_serial_data(void) {
   */
 int main(void)
 {
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
+
   HAL_Init();
   SystemClock_Config();
 
   MX_GPIO_Init();
   MX_TIM3_Init();
+  MX_IWDG_Init();               // Inisialisasi IWDG
   MX_USB_DEVICE_Init();
 
   /* USER CODE BEGIN 2 */
@@ -367,15 +352,11 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
     process_serial_data();
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
+    HAL_IWDG_Refresh(&hiwdg);
   }
-  /* USER CODE END 3 */
 }
 
 /**
@@ -424,6 +405,18 @@ static void MX_TIM3_Init(void)
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+    Error_Handler();
+}
+
+/**
+  * @brief IWDG Initialization (Watchdog ~500 ms)
+  */
+static void MX_IWDG_Init(void)
+{
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_256;  // LSI / 256 = ~125 Hz
+  hiwdg.Init.Reload    = 62;                  // 62 / 125 = 0.496 s ≈ 500 ms
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
     Error_Handler();
 }
 
